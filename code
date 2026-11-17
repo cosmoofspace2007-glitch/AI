@@ -1,0 +1,403 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+ 
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.tree import DecisionTreeRegressor, plot_tree
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+ 
+CSV_PATH = "gold_feature.csv"
+ 
+# Hai thuật toán được chọn để phân tích sâu. Chọn trong:
+# "Linear Regression", "Ridge", "Decision Tree", "Random Forest", "KNN"
+# Gợi ý: cặp cơ bản = "Linear Regression" + "Decision Tree"
+#        cặp đề xuất  = "Ridge" + "Random Forest"
+MODEL_A = "Ridge"
+MODEL_B = "Random Forest"
+
+
+
+# %% 1. Đọc dữ liệu và mô tả
+df = pd.read_csv(CSV_PATH)
+df["Date"] = pd.to_datetime(df["Date"])
+df = df.sort_values("Date").set_index("Date")
+ 
+print("Kích thước:", df.shape)
+print("Từ", df.index.min().date(), "đến", df.index.max().date())
+print("\n5 dòng đầu:")
+print(df.head())
+print("\nThống kê mô tả:")
+print(df.describe().round(2).T)
+
+
+
+# %% 2. Làm sạch dữ liệu
+price_cols = ["Gold_Open", "Gold_High", "Gold_Low", "Gold_Close"]
+num_cols = [c for c in df.columns]  # toàn bộ cột đều là số
+ 
+# 2.1 Ngày trùng
+n0 = len(df)
+df = df[~df.index.duplicated(keep="first")].sort_index()
+print("Ngày trùng đã xóa:", n0 - len(df))
+ 
+# 2.2 Giá trị thiếu: điền bằng giá ngày trước (không dùng trung bình vì làm sai chuỗi thời gian)
+print("\nGiá trị thiếu mỗi cột:\n", df.isna().sum()[df.isna().sum() > 0])
+df[num_cols] = df[num_cols].ffill()
+df = df.dropna(subset=num_cols)
+ 
+# 2.3 Giá trị vô lý
+bad_price = (df[price_cols] <= 0).any(axis=1)
+bad_hl = df["Gold_High"] < df["Gold_Low"]
+bad_close = (df["Gold_Close"] > df["Gold_High"]) | (df["Gold_Close"] < df["Gold_Low"])
+print("\nGiá <= 0:", bad_price.sum(), "| High < Low:", bad_hl.sum(),
+      "| Close ngoài [Low, High] (chỉ báo cáo):", bad_close.sum())
+df = df[~(bad_price | bad_hl)]
+ 
+# 2.4 Ngoại lai: CHỈ KIỂM TRA, không xóa (biến động mạnh của thị trường là thật)
+ret_check = df["Gold_Close"].pct_change() * 100
+print("\nNgày vàng biến động > 6%/ngày (xem lại có phải lỗi nhập liệu không):")
+print(ret_check[ret_check.abs() > 6].round(2))
+ 
+# 2.5 Khoảng trống thời gian bất thường
+gaps = df.index.to_series().diff().dt.days
+print("\nKhoảng trống > 7 ngày:", (gaps > 7).sum())
+print("Kích thước sau khi làm sạch:", df.shape)
+
+
+
+# %% 3. Tạo đặc trưng
+f = df.copy()
+ 
+# 3.1 Lợi suất ngày (%) của vàng và các biến thị trường
+f["Gold_ret"] = f["Gold_Close"].pct_change() * 100
+f["USD_ret"] = f["USD_Index"].pct_change() * 100
+f["WTI_ret"] = f["WTI_Crude"].pct_change() * 100
+f["Silver_ret"] = f["Silver"].pct_change() * 100
+f["NDQ_ret"] = f["NDQ"].pct_change() * 100
+f["SPX_ret"] = f["SPX"].pct_change() * 100
+f["Bond_chg"] = f["Bond_Yield"].diff()  # thay đổi điểm phần trăm
+ 
+# 3.2 Đặc trưng riêng của vàng
+for k in [1, 2, 3, 5]:
+    f[f"gold_ret_lag_{k}"] = f["Gold_ret"].shift(k)
+f["Close_vs_MA20"] = f["Gold_Close"] / f["Gold_Close"].rolling(20).mean() - 1
+f["Close_vs_MA50"] = f["Gold_Close"] / f["Gold_Close"].rolling(50).mean() - 1
+f["Volatility_20"] = f["Gold_ret"].rolling(20).std()
+f["HL_range"] = (f["Gold_High"] - f["Gold_Low"]) / f["Gold_Close"]
+f["Gap_open"] = f["Gold_Open"] / f["Gold_Close"].shift(1) - 1
+ 
+ 
+def rsi(s, period=14):
+    delta = s.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    return 100 - 100 / (1 + gain / loss)
+ 
+ 
+f["RSI14"] = rsi(f["Gold_Close"])
+ 
+# 3.3 Nhãn: lợi suất và giá của NGÀY HÔM SAU
+f["target_price"] = f["Gold_Close"].shift(-1)
+f["target_return"] = (f["target_price"] / f["Gold_Close"] - 1) * 100
+ 
+feats_gold = ["Gold_ret", "gold_ret_lag_1", "gold_ret_lag_2", "gold_ret_lag_3",
+              "gold_ret_lag_5", "Close_vs_MA20", "Close_vs_MA50", "RSI14",
+              "Volatility_20", "HL_range", "Gap_open"]
+feats_market = ["USD_ret", "WTI_ret", "Silver_ret", "NDQ_ret", "SPX_ret", "Bond_chg"]
+feats_full = feats_gold + feats_market
+ 
+data = f.dropna(subset=feats_full + ["target_return", "target_price"]).copy()
+print("Số mẫu dùng để mô hình hóa:", len(data))
+
+
+
+# %% 4. Chia train/test theo thời gian (80% đầu / 20% cuối, KHÔNG shuffle)
+split = int(len(data) * 0.8)
+train, test = data.iloc[:split], data.iloc[split:]
+print("Train:", train.index.min().date(), "->", train.index.max().date(), f"({len(train)} mẫu)")
+print("Test :", test.index.min().date(), "->", test.index.max().date(), f"({len(test)} mẫu)")
+ 
+y_test_price = test["target_price"]
+base_price = test["Gold_Close"].values
+ 
+# %% 5. BIỂU ĐỒ 1: Giá vàng theo thời gian, đánh dấu train/test và các mốc lớn
+split_date = test.index[0]
+events = {"2008-09-15": "Lehman sụp đổ", "2020-03-11": "COVID-19", "2022-02-24": "Nga - Ukraine"}
+ 
+fig, ax = plt.subplots(figsize=(13, 5))
+ax.plot(train.index, train["Gold_Close"], color="tab:blue", label="Train (80%)")
+ax.plot(test.index, test["Gold_Close"], color="tab:orange", label="Test (20%)")
+ax.axvline(split_date, color="gray", linestyle="--")
+ax.axvspan(split_date, test.index[-1], color="tab:orange", alpha=0.08)
+for d_str, label in events.items():
+    d_ev = pd.Timestamp(d_str)
+    if data.index.min() < d_ev < data.index.max():
+        ax.axvline(d_ev, color="red", alpha=0.4, linestyle=":")
+        ax.text(d_ev, ax.get_ylim()[1] * 0.95, " " + label, rotation=90, va="top",
+                color="red", fontsize=9)
+ax.set_title("Giá vàng đóng cửa theo thời gian, cách chia train/test và các mốc lớn")
+ax.set_xlabel("Ngày")
+ax.set_ylabel("Giá đóng cửa")
+ax.legend(loc="upper left")
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("chart1_train_test_split.png", dpi=150)
+plt.show()
+ 
+# %% 6. BIỂU ĐỒ 2: Các biến thị trường chuẩn hóa về mốc 100 (thang log)
+cols_norm = ["Gold_Close", "Silver", "WTI_Crude", "NDQ", "SPX", "USD_Index"]
+norm = df[cols_norm] / df[cols_norm].iloc[0] * 100
+ 
+fig, ax = plt.subplots(figsize=(13, 5))
+for c in cols_norm:
+    ax.plot(norm.index, norm[c], label=c, lw=2 if c == "Gold_Close" else 1,
+            color="gold" if c == "Gold_Close" else None)
+ax.set_yscale("log")
+ax.set_title("Vàng và các thị trường khác (ngày đầu = 100, thang log)")
+ax.set_ylabel("Chỉ số (ngày đầu = 100)")
+ax.legend(ncol=3)
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("chart2_normalized_markets.png", dpi=150)
+plt.show()
+ 
+# %% 7. BIỂU ĐỒ 3: Heatmap tương quan - mức giá và lợi suất ngày
+level_cols = ["Gold_Close", "Silver", "WTI_Crude", "USD_Index", "Bond_Yield", "NDQ", "SPX"]
+corr_level = df[level_cols].corr()
+ 
+ret_df = pd.DataFrame({
+    "Gold": df["Gold_Close"].pct_change(), "Silver": df["Silver"].pct_change(),
+    "WTI": df["WTI_Crude"].pct_change(), "USD": df["USD_Index"].pct_change(),
+    "Bond (thay đổi)": df["Bond_Yield"].diff(), "NDQ": df["NDQ"].pct_change(),
+    "SPX": df["SPX"].pct_change()}).dropna()
+corr_ret = ret_df.corr()
+ 
+ 
+def heat(ax, corr, labels, title):
+    im = ax.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticklabels(labels)
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            ax.text(j, i, f"{corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=8)
+    ax.set_title(title)
+    return im
+ 
+ 
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+heat(axes[0], corr_level, level_cols, "Tương quan của MỨC GIÁ")
+im = heat(axes[1], corr_ret, list(ret_df.columns), "Tương quan của LỢI SUẤT NGÀY")
+fig.colorbar(im, ax=axes, shrink=0.7)
+plt.savefig("chart3_correlation.png", dpi=150, bbox_inches="tight")
+plt.show()
+# Nhận xét gợi ý: tương quan mức giá thường cao do cùng có xu hướng dài hạn,
+# còn tương quan lợi suất mới phản ánh quan hệ thật theo ngày.
+ 
+# %% 8. Định nghĩa 5 mô hình ứng viên và hàm huấn luyện
+tscv = TimeSeriesSplit(n_splits=5)
+ 
+ 
+def make_specs():
+    return {
+        "Linear Regression": (make_pipeline(StandardScaler(), LinearRegression()),
+                              {"linearregression__fit_intercept": [True]}),
+        "Ridge": (make_pipeline(StandardScaler(), Ridge()),
+                  {"ridge__alpha": [0.1, 1, 10, 100, 1000]}),
+        "Decision Tree": (DecisionTreeRegressor(random_state=42),
+                          {"max_depth": [3, 5, 7], "min_samples_leaf": [10, 20, 50]}),
+        "Random Forest": (RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1),
+                          {"max_depth": [5, 8], "min_samples_leaf": [10, 20]}),
+        "KNN": (make_pipeline(StandardScaler(), KNeighborsRegressor()),
+                {"kneighborsregressor__n_neighbors": [5, 10, 20, 50]}),
+    }
+ 
+ 
+def fit_all(feature_list, names=None):
+    """Huấn luyện + chọn tham số bằng TimeSeriesSplit. Trả về dict tên -> GridSearchCV."""
+    fitted = {}
+    for name, (est, grid) in make_specs().items():
+        if names is not None and name not in names:
+            continue
+        gs = GridSearchCV(est, grid, cv=tscv, scoring="neg_mean_absolute_error")
+        gs.fit(train[feature_list], train["target_return"])
+        fitted[name] = gs
+    return fitted
+ 
+ 
+def to_price(ret_pred):
+    return base_price * (1 + ret_pred / 100)
+ 
+ 
+def evaluate(name, pred_price, pred_ret=None):
+    y = y_test_price.values
+    row = {
+        "Mô hình": name,
+        "MAE": mean_absolute_error(y, pred_price),
+        "RMSE": np.sqrt(mean_squared_error(y, pred_price)),
+        "MAPE (%)": np.mean(np.abs((y - pred_price) / y)) * 100,
+        "R2": r2_score(y, pred_price),
+    }
+    if pred_ret is not None:
+        row["Đúng hướng (%)"] = np.mean(np.sign(pred_ret) == np.sign(test["target_return"].values)) * 100
+    return row
+ 
+ 
+# %% 9. Huấn luyện cả 5 mô hình (đặc trưng đầy đủ) và so sánh
+fitted_full = fit_all(feats_full)
+ 
+rows = [evaluate("Baseline (giá hôm nay)", base_price)]
+preds_ret = {}
+for name, gs in fitted_full.items():
+    r = gs.predict(test[feats_full])
+    preds_ret[name] = r
+    row = evaluate(name, to_price(r), r)
+    row["CV MAE lợi suất (%)"] = -gs.best_score_
+    rows.append(row)
+    print(f"{name:18s} tham số tốt nhất: {gs.best_params_}")
+ 
+results_df = pd.DataFrame(rows).set_index("Mô hình")
+print("\n===== SO SÁNH TRÊN TẬP TEST (thang giá) =====")
+print(results_df.round(3).to_string())
+print("\nMô hình có CV MAE thấp nhất:", results_df["CV MAE lợi suất (%)"].idxmin())
+print(f"Hai mô hình được chọn để phân tích sâu: {MODEL_A} và {MODEL_B}")
+ 
+chosen = [MODEL_A, MODEL_B]
+ 
+# %% 10. BIỂU ĐỒ 4: Thực tế và dự đoán trên tập test
+colors = {MODEL_A: "tab:blue", MODEL_B: "tab:red"}
+ 
+ 
+def draw(ax, idx, title):
+    ax.plot(y_test_price.index[idx], y_test_price.values[idx], color="black", lw=2, label="Thực tế")
+    for m in chosen:
+        ax.plot(y_test_price.index[idx], to_price(preds_ret[m])[idx], color=colors[m],
+                alpha=0.8, label=m)
+    ax.set_title(title)
+    ax.set_ylabel("Giá đóng cửa")
+    ax.legend(loc="upper left")
+    ax.grid(alpha=0.3)
+ 
+ 
+fig, axes = plt.subplots(2, 1, figsize=(13, 9))
+draw(axes[0], slice(None), "Thực tế và dự đoán trên toàn bộ tập test")
+draw(axes[1], slice(-120, None), "Phóng to 120 ngày cuối của tập test")
+plt.tight_layout()
+plt.savefig("chart4_actual_vs_pred.png", dpi=150)
+plt.show()
+ 
+# %% 11. BIỂU ĐỒ 5: Bảng và biểu đồ cột so sánh các chỉ số
+print(results_df.round(3).to_string())  # chép bảng này vào báo cáo
+ 
+metrics = ["MAE", "RMSE", "MAPE (%)", "R2"]
+palette = plt.cm.tab10.colors
+ 
+fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+for ax, m in zip(axes.ravel(), metrics):
+    vals = results_df[m]
+    bars = ax.bar(range(len(vals)), vals.values, color=palette[:len(vals)])
+    ax.set_xticks(range(len(vals)))
+    ax.set_xticklabels([n.replace(" (", "\n(").replace(" ", "\n", 1) if len(n) > 12 else n
+                        for n in vals.index], fontsize=8)
+    ax.set_title(m + (" (càng cao càng tốt)" if m == "R2" else " (càng thấp càng tốt)"))
+    for b, v in zip(bars, vals.values):
+        ax.annotate(f"{v:.3f}", (b.get_x() + b.get_width() / 2, v), ha="center",
+                    va="bottom" if v >= 0 else "top", fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+plt.suptitle("So sánh các mô hình trên tập test", fontsize=14)
+plt.tight_layout()
+plt.savefig("chart5_metrics.png", dpi=150)
+plt.show()
+ 
+ 
+# %% 12. BIỂU ĐỒ 6: Mức độ ảnh hưởng của từng đặc trưng
+def importance(est, names):
+    m = est[-1] if hasattr(est, "steps") else est
+    if hasattr(m, "feature_importances_"):
+        return pd.Series(m.feature_importances_, index=names), "Feature importance (mô hình cây)"
+    if hasattr(m, "coef_"):
+        return pd.Series(np.abs(m.coef_), index=names), "|Hệ số| sau chuẩn hóa (mô hình tuyến tính)"
+    return None, None  # KNN không có độ quan trọng đặc trưng
+ 
+ 
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+for ax, m in zip(axes, chosen):
+    imp, xlabel = importance(fitted_full[m].best_estimator_, feats_full)
+    if imp is None:
+        ax.text(0.5, 0.5, f"{m} không có\nđộ quan trọng đặc trưng", ha="center", va="center")
+        ax.set_axis_off()
+        continue
+    imp = imp.sort_values()
+    colors_bar = ["tab:orange" if i in feats_market else "tab:blue" for i in imp.index]
+    ax.barh(imp.index, imp.values, color=colors_bar)
+    ax.set_title(m)
+    ax.set_xlabel(xlabel)
+    ax.grid(axis="x", alpha=0.3)
+fig.suptitle("Yếu tố nào ảnh hưởng nhất đến lợi suất vàng ngày mai? (cam = biến thị trường, xanh = đặc trưng của vàng)")
+plt.tight_layout()
+plt.savefig("chart6_importance.png", dpi=150)
+plt.show()
+ 
+# %% 13. BIỂU ĐỒ 7: Có và không có biến thị trường
+fitted_gold = fit_all(feats_gold, names=chosen)
+ 
+mae_full, mae_gold = [], []
+for m in chosen:
+    p_full = to_price(fitted_full[m].predict(test[feats_full]))
+    p_gold = to_price(fitted_gold[m].predict(test[feats_gold]))
+    mae_full.append(mean_absolute_error(y_test_price, p_full))
+    mae_gold.append(mean_absolute_error(y_test_price, p_gold))
+mae_base = mean_absolute_error(y_test_price, base_price)
+ 
+x = np.arange(len(chosen))
+fig, ax = plt.subplots(figsize=(8, 5))
+b1 = ax.bar(x - 0.18, mae_gold, 0.36, label="Chỉ đặc trưng của vàng", color="tab:blue")
+b2 = ax.bar(x + 0.18, mae_full, 0.36, label="Thêm biến thị trường", color="tab:orange")
+ax.axhline(mae_base, color="gray", linestyle="--", label="Baseline (giá hôm nay)")
+for b in list(b1) + list(b2):
+    ax.annotate(f"{b.get_height():.3f}", (b.get_x() + b.get_width() / 2, b.get_height()),
+                ha="center", va="bottom", fontsize=9)
+ax.set_xticks(x)
+ax.set_xticklabels(chosen)
+ax.set_ylabel("MAE trên tập test (thang giá)")
+ax.set_title("Biến thị trường có giúp dự đoán tốt hơn không?")
+ax.legend()
+ax.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.savefig("chart7_with_without_market.png", dpi=150)
+plt.show()
+ 
+# %% 14. BIỂU ĐỒ 8: Phân tích sai số của mô hình tốt hơn trong 2 mô hình được chọn
+best = min(chosen, key=lambda m: results_df.loc[m, "MAE"])
+err = y_test_price.values - to_price(preds_ret[best])
+ 
+fig, axes = plt.subplots(1, 2, figsize=(15, 4.5), gridspec_kw={"width_ratios": [2, 1]})
+axes[0].plot(y_test_price.index, err, lw=0.8)
+axes[0].axhline(0, color="black", lw=0.8)
+axes[0].set_title(f"Sai số dự đoán theo thời gian - {best} (thực tế - dự đoán)")
+axes[0].set_ylabel("Sai số (giá)")
+axes[0].grid(alpha=0.3)
+axes[1].hist(err, bins=40, color="tab:green", edgecolor="white")
+axes[1].set_title("Phân phối sai số")
+axes[1].set_xlabel("Sai số (giá)")
+plt.tight_layout()
+plt.savefig("chart8_residuals.png", dpi=150)
+plt.show()
+ 
+# %% 15. (Tùy chọn) Vẽ cây quyết định nông nếu MODEL_A hoặc MODEL_B là Decision Tree
+if "Decision Tree" in chosen:
+    tree_demo = DecisionTreeRegressor(max_depth=3, min_samples_leaf=20, random_state=42)
+    tree_demo.fit(train[feats_full], train["target_return"])
+    fig, ax = plt.subplots(figsize=(20, 8))
+    plot_tree(tree_demo, feature_names=feats_full, filled=True, rounded=True,
+              fontsize=9, ax=ax, precision=2)
+    ax.set_title("Cây quyết định (max_depth=3) dự đoán lợi suất vàng ngày hôm sau (%)")
+    plt.tight_layout()
+    plt.savefig("chart9_tree.png", dpi=150)
+    plt.show()
